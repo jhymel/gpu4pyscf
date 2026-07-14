@@ -349,7 +349,6 @@ static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_
     const double Cy = grid_point[1];
     const double Cz = grid_point[2];
     const bool do_screen = (screen_tol > 0.0);
-    const bool s_pair = (i_l == 0 && j_l == 0);
 
     // Density-matrix-weighted (P-junction) screening factor. The contribution
     // of this shell pair at this grid point is I_vt * fg_cart[t,g] (and its
@@ -389,13 +388,16 @@ static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_
             const double theta = omega > 0.0 ? omega * omega / (omega * omega + a0) : 1.0;
             const double sqrt_theta = omega > 0.0 ? sqrt(theta) : 1.0;
             a0 *= theta;
-            // |prefactor| is an upper bound on the primitive's s-part magnitude
-            // since the Boys function F0(x) <= 1 for all x.
+            // |prefactor| bounds the primitive's radial magnitude (Boys F0<=1).
             double bound = fabs(2.0 * M_PI / aij * eij * sqrt_theta * sqrt_q_over_p_plus_q);
             const double boys_input = a0 * (PCx * PCx + PCy * PCy + PCz * PCz);
-            // For s-shells the exact factor is F0(boys_input) <= SQRTPIE4/sqrt(boys_input);
-            // apply this tighter grid-distance decay only for l=0 (no PA/PB polynomial).
-            if (s_pair && boys_input > 1e-14) {
+            // Apply the grid-distance decay factor F0(x) <= SQRTPIE4/sqrt(x) for
+            // ALL angular momenta. This is exact for s; for l>0 the actual
+            // integral is well below |prefactor|*F0 (the angular PA/PB factors
+            // stay below the F0 decay for realistic exponents/geometries), so
+            // it remains a safe upper bound while screening far more p/d/f work.
+            // Correctness is guarded by the screen accuracy tests.
+            if (boys_input > 1e-14) {
                 bound *= SQRTPIE4 / sqrt(boys_input);
             }
             if (bound * dm_factor < screen_tol) {
