@@ -7,16 +7,19 @@ full-range hybrids only (omega == 0). See tests/test_sgx_scf.py for the spec.
 from __future__ import annotations
 
 
-def cosx_fit(mf, grid_level=1, blksize=None):
+def cosx_fit(mf, grid_level=1, blksize=None, fused=False, screen_tol=0.0):
     """Wrap a GPU4PySCF density-fitted RKS so exchange K is computed by COSX.
 
     Args:
         mf: a GPU4PySCF ``RKS(...).density_fit()`` mean-field object (hybrid xc).
         grid_level: Becke grid level for the COSX K grid.
         blksize: grid-block size for the COSX K build (streams the seminumerical
-            integral in chunks to bound peak GPU memory). Defaults to a value
-            that keeps the per-block (ngrids_blk, nao, nao) integral tensor
-            within a few hundred MB.
+            integral in chunks to bound peak GPU memory).
+        fused: if True, use the tensor-free fused all-L kernel
+            (``get_k_fused_direct``) for exchange instead of the streamed
+            ``get_k`` — lower peak memory and DM-screening-accelerated.
+        screen_tol: density-matrix screening tolerance for the fused path
+            (0 disables screening). Ignored when ``fused`` is False.
 
     Returns:
         The same ``mf`` object with ``get_k`` overridden to use COSX-K.
@@ -26,6 +29,7 @@ def cosx_fit(mf, grid_level=1, blksize=None):
     from gpu4pyscf.dft import gen_grid as ggen
 
     from gpu4pyscf.sgx.sgx_jk import get_k as cosx_get_k
+    from gpu4pyscf.sgx.sgx_kfused import get_k_fused_direct
 
     ni = mf._numint
     omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mf.mol.spin)
@@ -53,6 +57,11 @@ def cosx_fit(mf, grid_level=1, blksize=None):
         if omega:
             raise NotImplementedError(
                 "COSX prototype does not support screened-Coulomb (omega!=0) K"
+            )
+        if fused:
+            return get_k_fused_direct(
+                mol if mol is not None else mf.mol, cp.asarray(dm), g,
+                ovlp_fit=True, blksize=blksize, screen_tol=screen_tol,
             )
         return cosx_get_k(
             mol if mol is not None else mf.mol, cp.asarray(dm), g,
