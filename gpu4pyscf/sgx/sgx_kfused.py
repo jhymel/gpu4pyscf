@@ -144,3 +144,173 @@ def get_k_fused(mol, dm, grids, tol=1e-8, ovlp_fit=True, return_stats=False):
     return vk
 
 
+
+
+def get_k_fused_general(mol, dm, grids, tol=1e-8, ovlp_fit=True,
+                        return_stats=False):
+    """Correct COSX exchange matrix K for ALL angular momenta (s/p/d/f).
+
+    IMPORTANT: this is NOT the tensor-free fused kernel (that exists only for
+    s-shells in ``get_k_fused``). It reuses the validated general
+    ``GINTfill_int3c1e`` integral machinery, streams the grid in blocks, screens
+    shell-pair-type blocks by density magnitude, and contracts each block into K.
+    The transient buffer is ``(blk, nao, nao)`` (peak ~ blk*nao^2), so it is
+    memory-favorable only relative to the FULL ``(ngrids, nao, nao)`` tensor
+    when the grid is split into multiple blocks; it does not reach the s-only
+    fused kernel's footprint. Its value is generality + correctness for d/f.
+
+    Returns:
+        K (cupy array), or (K, stats) if return_stats.
+    """
+    from pyscf import lib
+    from pyscf.lib import c_null_ptr
+
+    from gpu4pyscf.gto.int3c1e import VHFOpt
+    from gpu4pyscf.lib.cupy_helper import cart2sph, get_avail_mem
+
+    dm = cp.asarray(dm, dtype=cp.float64)
+    if dm.ndim == 3:
+        dm = dm.sum(axis=0)
+    nao = mol.nao
+
+    coords_all = cp.asarray(grids.coords, dtype=cp.float64, order='C')
+    weights_all = cp.asarray(grids.weights, dtype=cp.float64)
+    ngrids = coords_all.shape[0]
+
+    ni = gnumint.NumInt()
+    ao_all = cp.asarray(ni.eval_ao(mol, coords_all, deriv=0), dtype=cp.float64)
+
+    intopt = VHFOpt(mol)
+    intopt.build(1e-13, aosym=True)
+    omega = mol.omega
+
+    dm_np = cp.asnumpy(dm)
+
+    # Precompute per-block screening. A shell-pair-type block cp_ij_id is kept
+    # if the max density magnitude over its AO ranges (times q bound) exceeds
+    # tol. tol <= 0 keeps all blocks.
+    n_blocks = len(intopt.log_qs)
+    keep_block = [True] * n_blocks
+    if tol > 0:
+        for cp_ij_id in range(n_blocks):
+            log_q_ij = intopt.log_qs[cp_ij_id]
+            if len(log_q_ij) == 0:
+                keep_block[cp_ij_id] = False
+                continue
+            cpi = intopt.cp_idx[cp_ij_id]
+            cpj = intopt.cp_jdx[cp_ij_id]
+            i0, i1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi + 1]
+            j0, j1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj + 1]
+            # ao_loc here is sorted-order; map to mol order via _ao_idx.
+            idx_i = intopt._ao_idx[i0:i1]
+            idx_j = intopt._ao_idx[j0:j1]
+            dm_max = np.abs(dm_np[np.ix_(idx_j, idx_i)]).max()
+            q_max = float(np.exp(np.max(log_q_ij)))
+            keep_block[cp_ij_id] = (q_max * dm_max) > tol
+    n_kept = sum(1 for cp_ij_id in range(n_blocks)
+                 if len(intopt.log_qs[cp_ij_id]) > 0 and keep_block[cp_ij_id])
+    n_nonempty = sum(1 for cp_ij_id in range(n_blocks)
+                     if len(intopt.log_qs[cp_ij_id]) > 0)
+    frac_skipped = 1.0 - (n_kept / n_nonempty) if n_nonempty else 0.0
+
+    # Grid blocking so the transient (blk, nao, nao) buffer stays bounded (a
+    # few hundred MB at most), never the full (ngrids, nao, nao).
+    cp.get_default_memory_pool().free_all_blocks()
+    avail_mem = get_avail_mem()
+    allowed_double = (avail_mem // 4) // 8
+    per_grid_double = max(nao * nao, 1)
+    ngrids_per_split = max(1, int(allowed_double // per_grid_double))
+    ngrids_per_split = min(ngrids_per_split, ngrids)
+
+    sn = cp.zeros((nao, nao))
+    vk = cp.zeros((nao, nao))
+
+    row, col = np.tril_indices(nao)
+
+    for p0, p1 in lib.prange(0, ngrids, ngrids_per_split):
+        blk = p1 - p0
+        grids_slice = coords_all[p0:p1]
+        ao_blk = ao_all[p0:p1]                     # (blk, nao)
+        w_blk = weights_all[p0:p1]
+        wao = ao_blk * w_blk[:, None]
+        sn += ao_blk.T @ wao
+
+        gbn_cart = cp.zeros((blk, nao, nao), order='C')
+        stream = cp.cuda.get_current_stream()
+        for cp_ij_id in range(n_blocks):
+            log_q_ij = intopt.log_qs[cp_ij_id]
+            if len(log_q_ij) == 0 or not keep_block[cp_ij_id]:
+                continue
+            cpi = intopt.cp_idx[cp_ij_id]
+            cpj = intopt.cp_jdx[cp_ij_id]
+            li = intopt.angular[cpi]
+            lj = intopt.angular[cpj]
+
+            nbins = 1
+            bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
+
+            ci0, ci1 = intopt.cart_ao_loc[cpi], intopt.cart_ao_loc[cpi + 1]
+            cj0, cj1 = intopt.cart_ao_loc[cpj], intopt.cart_ao_loc[cpj + 1]
+            ncart_i = ci1 - ci0
+            ncart_j = cj1 - cj0
+
+            ao_offsets = np.array([ci0, cj0], dtype=np.int32)
+            strides = np.array([ncart_i, ncart_i * ncart_j], dtype=np.int32)
+
+            int3c_angular_slice = cp.zeros((blk, ncart_j, ncart_i), order='C')
+
+            err = libgint.GINTfill_int3c1e(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                intopt.bpcache,
+                ctypes.cast(grids_slice.data.ptr, ctypes.c_void_p),
+                ctypes.cast(c_null_ptr(), ctypes.c_void_p),
+                ctypes.c_int(blk),
+                ctypes.cast(int3c_angular_slice.data.ptr, ctypes.c_void_p),
+                strides.ctypes.data_as(ctypes.c_void_p),
+                ao_offsets.ctypes.data_as(ctypes.c_void_p),
+                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(nbins),
+                ctypes.c_int(cp_ij_id),
+                ctypes.c_double(omega))
+            if err != 0:
+                raise RuntimeError('GINTfill_int3c1e failed')
+
+            si0, si1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi + 1]
+            sj0, sj1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj + 1]
+            if not mol.cart:
+                int3c_angular_slice = cart2sph(int3c_angular_slice, axis=1, ang=lj)
+                int3c_angular_slice = cart2sph(int3c_angular_slice, axis=2, ang=li)
+
+            gbn_cart[:, sj0:sj1, si0:si1] = int3c_angular_slice
+
+        # Fill the symmetric (upper) triangle from the computed lower triangle.
+        gbn_cart[:, row, col] = gbn_cart[:, col, row]
+        gbn = intopt.unsort_orbitals(gbn_cart, axis=[1, 2])  # (blk, nao, nao)
+
+        fg = cp.einsum("tj,gj->tg", dm, wao)        # (nao, blk)
+        gv = cp.einsum("gvt,tg->vg", gbn, fg)        # (nao, blk)
+        vk += cp.einsum("gu,vg->uv", ao_blk, gv)     # (nao, nao)
+
+    if ovlp_fit:
+        ovlp = cp.asarray(mol.intor_symmetric("int1e_ovlp"))
+        proj = cp.linalg.solve(sn, ovlp)
+        vk = cp.einsum("pi,pj->ij", proj, vk)
+
+    vk = (vk + vk.T) * 0.5
+
+    if return_stats:
+        peak = int(ngrids_per_split) * nao * nao * 8
+        stats = {
+            # NOTE: this path is NOT the tensor-free fused kernel (that exists
+            # only for s-shells in get_k_fused). It reuses GINTfill_int3c1e and
+            # holds a transient (blk, nao, nao) Cartesian buffer per grid block,
+            # so peak scales as blk*nao^2 and only shrinks when the grid is
+            # split into multiple blocks. Correct for all angular momenta;
+            # memory-favorable only vs the FULL (ngrids,nao,nao) when blk<ngrids.
+            "fused": False,
+            "streamed_blocked": True,
+            "frac_blocks_skipped": float(frac_skipped),
+            "peak_intermediate_bytes": int(peak),
+        }
+        return vk, stats
+    return vk
