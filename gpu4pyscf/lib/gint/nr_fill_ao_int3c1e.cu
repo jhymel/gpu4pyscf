@@ -144,7 +144,135 @@ static int GINTfill_int3c1e_density_contracted_tasks(double* output, const doubl
     return 0;
 }
 
+// B2.3: fused COSX exchange-K for s-shells (l=0). One thread per grid point.
+// Computes the s-shell 3c-1e integral I_vt(g) = (v|1/|r-Cg||t) inline (same
+// formula as GINTfill_int3c1e_density_contracted_kernel00) from raw per-shell
+// primitive data, then contracts directly into K without ever materializing the
+// (ngrids, nao, nao) tensor. For s-shells nbas == nao (1 AO per shell).
+#define SGX_FUSED_MAX_NAO 64
+
+__global__
+static void GINTsgx_fused_k_s_kernel(double* K, const double* ao, const double* dm,
+                                     const double* weights, const double* grid_points,
+                                     const int* keep, const double* sh_center,
+                                     const int* sh_nprim, const int* sh_prim_off,
+                                     const double* prim_exp, const double* prim_coef,
+                                     const int nao, const int ngrids, const double omega)
+{
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= ngrids) {
+        return;
+    }
+
+    const double w = weights[g];
+    const double Cx = grid_points[g * 3 + 0];
+    const double Cy = grid_points[g * 3 + 1];
+    const double Cz = grid_points[g * 3 + 2];
+
+    // fg[t] = sum_j dm[t,j] * w * ao[g,j]
+    double fg[SGX_FUSED_MAX_NAO];
+    for (int t = 0; t < nao; t++) {
+        double acc = 0.0;
+        for (int j = 0; j < nao; j++) {
+            acc += dm[t * nao + j] * ao[g * nao + j];
+        }
+        fg[t] = acc * w;
+    }
+
+    // gv[v] = sum_t I_vt(g) * fg[t]
+    for (int v = 0; v < nao; v++) {
+        const int nv = sh_nprim[v];
+        const int ov = sh_prim_off[v];
+        const double Ax = sh_center[v * 3 + 0];
+        const double Ay = sh_center[v * 3 + 1];
+        const double Az = sh_center[v * 3 + 2];
+
+        double gv = 0.0;
+        for (int t = 0; t < nao; t++) {
+            if (keep != NULL && keep[v * nao + t] == 0) {
+                continue;
+            }
+            const int nt = sh_nprim[t];
+            const int ot = sh_prim_off[t];
+            const double Bx = sh_center[t * 3 + 0];
+            const double By = sh_center[t * 3 + 1];
+            const double Bz = sh_center[t * 3 + 2];
+
+            const double ABx = Ax - Bx;
+            const double ABy = Ay - By;
+            const double ABz = Az - Bz;
+            const double AB2 = ABx * ABx + ABy * ABy + ABz * ABz;
+
+            double I_vt = 0.0;
+            for (int ip = 0; ip < nv; ip++) {
+                const double ai = prim_exp[ov + ip];
+                const double ci = prim_coef[ov + ip];
+                for (int jp = 0; jp < nt; jp++) {
+                    const double aj = prim_exp[ot + jp];
+                    const double cj = prim_coef[ot + jp];
+
+                    const double aij = ai + aj;
+                    const double eij = ci * cj * exp(-ai * aj / aij * AB2);
+                    const double Px = (ai * Ax + aj * Bx) / aij;
+                    const double Py = (ai * Ay + aj * By) / aij;
+                    const double Pz = (ai * Az + aj * Bz) / aij;
+                    const double PCx = Px - Cx;
+                    const double PCy = Py - Cy;
+                    const double PCz = Pz - Cz;
+
+                    double a0 = aij;
+                    const double theta = omega > 0.0 ? omega * omega / (omega * omega + a0) : 1.0;
+                    const double sqrt_theta = omega > 0.0 ? sqrt(theta) : 1.0;
+                    a0 *= theta;
+
+                    const double prefactor = 2.0 * M_PI / aij * eij * sqrt_theta;
+                    const double boys_input = a0 * (PCx * PCx + PCy * PCy + PCz * PCz);
+                    double eri = prefactor;
+                    if (boys_input > 1e-14) {
+                        const double sqrt_boys_input = sqrt(boys_input);
+                        const double boys_0 = SQRTPIE4 / sqrt_boys_input * erf(sqrt_boys_input);
+                        eri *= boys_0;
+                    }
+                    I_vt += eri;
+                }
+            }
+            gv += I_vt * fg[t];
+        }
+
+        // K[u,v] += ao[g,u] * gv  for all u
+        for (int u = 0; u < nao; u++) {
+            const double contrib = ao[g * nao + u] * gv;
+            if (contrib != 0.0) {
+                atomicAdd(K + (u * nao + v), contrib);
+            }
+        }
+    }
+}
+
 extern "C" {
+int GINTsgx_fused_k_s(const cudaStream_t stream, double* K, const double* ao, const double* dm,
+                      const double* weights, const double* grid_points, const int* keep,
+                      const double* sh_center, const int* sh_nprim, const int* sh_prim_off,
+                      const double* prim_exp, const double* prim_coef,
+                      const int nao, const int ngrids, const double omega)
+{
+    if (nao > SGX_FUSED_MAX_NAO) {
+        fprintf(stderr, "GINTsgx_fused_k_s: nao=%d exceeds SGX_FUSED_MAX_NAO=%d\n", nao, SGX_FUSED_MAX_NAO);
+        return 1;
+    }
+    const int threads = 128;
+    const int blocks = (ngrids + threads - 1) / threads;
+    GINTsgx_fused_k_s_kernel<<<blocks, threads, 0, stream>>>(
+        K, ao, dm, weights, grid_points, keep, sh_center, sh_nprim, sh_prim_off,
+        prim_exp, prim_coef, nao, ngrids, omega);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in %s: %s\n", __func__, cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
 int GINTfill_int3c1e(const cudaStream_t stream, const BasisProdCache* bpcache,
                      const double* grid_points, const double* charge_exponents, const int ngrids,
                      double* integrals,
