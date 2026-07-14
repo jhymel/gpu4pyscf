@@ -249,6 +249,133 @@ static void GINTsgx_fused_k_s_kernel(double* K, const double* ao, const double* 
     }
 }
 
+// ---------------------------------------------------------------------------
+// TRUE tensor-free fused COSX exchange-K path for ALL angular momenta.
+//
+// Instead of writing each shell-pair's Cartesian 3c-1e integral into a
+// (ngrids, nao, nao) tensor, this kernel contracts it on the fly into the
+// intermediate gv_cart[v, g] (shape (nao_cart, ngrids), row-major):
+//     gv[i, g] += I_{i,j}(g) * fg[j, g]            (bra i, ket j)
+// and, for off-diagonal shell pairs (ish != jsh), also the transpose
+//     gv[j, g] += I_{i,j}(g) * fg[i, g]
+// so that the fully symmetric integral is accounted for while enumerating
+// only the lower-triangle shell pairs (exactly the aosym pair list that
+// GINTfill_int3c1e uses). gv_cart and fg_cart use absolute Cartesian
+// sorted-AO indices (c_bpcache.ao_loc), so no ao_offsets are needed.
+template <int NROOTS>
+__device__
+static void GINTcontract_gv_int3c1e(const double* g, double* gv_cart, const double* fg_cart,
+                                    const int ish, const int jsh, const int i_grid,
+                                    const int i_l, const int j_l, const int ngrids)
+{
+    const int* ao_loc = c_bpcache.ao_loc;
+
+    const int i0 = ao_loc[ish];
+    const int i1 = ao_loc[ish+1];
+    const int j0 = ao_loc[jsh];
+    const int j1 = ao_loc[jsh+1];
+
+    const int *idx = c_idx;
+    const int *idy = c_idx + TOT_NF;
+    const int *idz = c_idx + TOT_NF * 2;
+
+    const int g_size = NROOTS * (i_l + 1) * (j_l + 1);
+    const double* __restrict__ gx = g;
+    const double* __restrict__ gy = g + g_size;
+    const double* __restrict__ gz = g + g_size * 2;
+
+    const bool diag = (ish == jsh);
+
+    for (int j = j0; j < j1; j++) {
+        for (int i = i0; i < i1; i++) {
+            const int loc_j = c_l_locs[j_l] + (j-j0);
+            const int loc_i = c_l_locs[i_l] + (i-i0);
+
+            int ix = idx[loc_i] + idx[loc_j] * (i_l + 1);
+            int iy = idy[loc_i] + idy[loc_j] * (i_l + 1);
+            int iz = idz[loc_i] + idz[loc_j] * (i_l + 1);
+
+            ix = ix * NROOTS;
+            iy = iy * NROOTS;
+            iz = iz * NROOTS;
+
+            double eri = 0;
+#pragma unroll
+            for (int i_root = 0; i_root < NROOTS; i_root++) {
+                eri += gx[ix + i_root] * gy[iy + i_root] * gz[iz + i_root];
+            }
+            // gv[i] += I_{i,j} * fg[j]
+            atomicAdd(gv_cart + (i * ngrids + i_grid), eri * fg_cart[j * ngrids + i_grid]);
+            // transpose contribution for off-diagonal shell pairs
+            if (!diag) {
+                atomicAdd(gv_cart + (j * ngrids + i_grid), eri * fg_cart[i * ngrids + i_grid]);
+            }
+        }
+    }
+}
+
+template <int NROOTS, int GSIZE_INT3C_1E>
+__global__
+static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_cart,
+                                              const BasisProdOffsets offsets, const int i_l, const int j_l,
+                                              const int nprim_ij, const int ngrids,
+                                              const double omega, const double* grid_points,
+                                              const double* charge_exponents)
+{
+    const int ntasks_ij = offsets.ntasks_ij;
+    const int task_ij = blockIdx.x * blockDim.x + threadIdx.x;
+    const int task_grid = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (task_ij >= ntasks_ij || task_grid >= ngrids) {
+        return;
+    }
+    const int bas_ij = offsets.bas_ij + task_ij;
+    const int prim_ij = offsets.primitive_ij + task_ij * nprim_ij;
+    const int* bas_pair2bra = c_bpcache.bas_pair2bra;
+    const int* bas_pair2ket = c_bpcache.bas_pair2ket;
+    const int ish = bas_pair2bra[bas_ij];
+    const int jsh = bas_pair2ket[bas_ij];
+
+    const double* grid_point = grid_points + task_grid * 3;
+    const double charge_exponent = (charge_exponents != NULL) ? charge_exponents[task_grid] : 0.0;
+
+    double g[GSIZE_INT3C_1E];
+
+    for (int ij = prim_ij; ij < prim_ij+nprim_ij; ++ij) {
+        GINT_g1e<NROOTS>(g, grid_point, ish, jsh, ij, i_l, j_l, charge_exponent, omega);
+        GINTcontract_gv_int3c1e<NROOTS>(g, gv_cart, fg_cart, ish, jsh, task_grid, i_l, j_l, ngrids);
+    }
+}
+
+static int GINTsgx_fused_k_gv_tasks(double* gv_cart, const double* fg_cart, const BasisProdOffsets offsets,
+                                    const int i_l, const int j_l, const int nprim_ij, const int ngrids,
+                                    const double omega, const double* grid_points,
+                                    const double* charge_exponents, const cudaStream_t stream)
+{
+    const int nrys_roots = (i_l + j_l) / 2 + 1;
+    const int ntasks_ij = offsets.ntasks_ij;
+
+    const dim3 threads(THREADSX, THREADSY);
+    const dim3 blocks((ntasks_ij+THREADSX-1)/THREADSX, (ngrids+THREADSY-1)/THREADSY);
+    switch (nrys_roots) {
+    case 1: GINTsgx_fused_k_gv_kernel_general<1, GSIZE1_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
+    case 2: GINTsgx_fused_k_gv_kernel_general<2, GSIZE2_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
+    case 3: GINTsgx_fused_k_gv_kernel_general<3, GSIZE3_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
+    case 4: GINTsgx_fused_k_gv_kernel_general<4, GSIZE4_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
+    case 5: GINTsgx_fused_k_gv_kernel_general<5, GSIZE5_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
+    default:
+        fprintf(stderr, "GINTsgx_fused_k_gv: rys roots %d out of range\n", nrys_roots);
+        return 1;
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in %s: %s\n", __func__, cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" {
 int GINTsgx_fused_k_s(const cudaStream_t stream, double* K, const double* ao, const double* dm,
                       const double* weights, const double* grid_points, const int* keep,
@@ -270,6 +397,53 @@ int GINTsgx_fused_k_s(const cudaStream_t stream, double* K, const double* ao, co
         fprintf(stderr, "CUDA Error in %s: %s\n", __func__, cudaGetErrorString(err));
         return 1;
     }
+    return 0;
+}
+
+int GINTsgx_fused_k_gv(const cudaStream_t stream, const BasisProdCache* bpcache,
+                       const double* grid_points, const double* charge_exponents, const int ngrids,
+                       double* gv_cart, const double* fg_cart,
+                       const int* bins_locs_ij, int nbins,
+                       const int cp_ij_id, const double omega)
+{
+    const ContractionProdType *cp_ij = bpcache->cptype + cp_ij_id;
+    const int i_l = cp_ij->l_bra;
+    const int j_l = cp_ij->l_ket;
+    const int nrys_roots = (i_l + j_l) / 2 + 1;
+    const int nprim_ij = cp_ij->nprim_12;
+
+    if (nrys_roots > MAX_NROOTS_INT3C_1E) {
+        fprintf(stderr, "nrys_roots = %d too high\n", nrys_roots);
+        return 2;
+    }
+
+    checkCudaErrors(cudaMemcpyToSymbol(c_bpcache, bpcache, sizeof(BasisProdCache)));
+
+    const int* bas_pairs_locs = bpcache->bas_pairs_locs;
+    const int* primitive_pairs_locs = bpcache->primitive_pairs_locs;
+    for (int ij_bin = 0; ij_bin < nbins; ij_bin++) {
+        const int bas_ij0 = bins_locs_ij[ij_bin];
+        const int bas_ij1 = bins_locs_ij[ij_bin + 1];
+        const int ntasks_ij = bas_ij1 - bas_ij0;
+        if (ntasks_ij <= 0) {
+            continue;
+        }
+
+        BasisProdOffsets offsets;
+        offsets.ntasks_ij = ntasks_ij;
+        offsets.ntasks_kl = ngrids;
+        offsets.bas_ij = bas_pairs_locs[cp_ij_id] + bas_ij0;
+        offsets.bas_kl = -1;
+        offsets.primitive_ij = primitive_pairs_locs[cp_ij_id] + bas_ij0 * nprim_ij;
+        offsets.primitive_kl = -1;
+
+        const int err = GINTsgx_fused_k_gv_tasks(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids,
+                                                 omega, grid_points, charge_exponents, stream);
+        if (err != 0) {
+            return err;
+        }
+    }
+
     return 0;
 }
 
