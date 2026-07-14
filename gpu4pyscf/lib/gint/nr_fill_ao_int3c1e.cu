@@ -320,7 +320,7 @@ static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_
                                               const BasisProdOffsets offsets, const int i_l, const int j_l,
                                               const int nprim_ij, const int ngrids,
                                               const double omega, const double* grid_points,
-                                              const double* charge_exponents)
+                                              const double* charge_exponents, const double screen_tol)
 {
     const int ntasks_ij = offsets.ntasks_ij;
     const int task_ij = blockIdx.x * blockDim.x + threadIdx.x;
@@ -339,9 +339,47 @@ static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_
     const double* grid_point = grid_points + task_grid * 3;
     const double charge_exponent = (charge_exponents != NULL) ? charge_exponents[task_grid] : 0.0;
 
+    // Per-primitive-pair data as read by GINT_g1e (see g1e.cu ~L27-54).
+    const double* __restrict__ a12 = c_bpcache.a12;
+    const double* __restrict__ e12 = c_bpcache.e12;
+    const double* __restrict__ x12 = c_bpcache.x12;
+    const double* __restrict__ y12 = c_bpcache.y12;
+    const double* __restrict__ z12 = c_bpcache.z12;
+    const double Cx = grid_point[0];
+    const double Cy = grid_point[1];
+    const double Cz = grid_point[2];
+    const bool do_screen = (screen_tol > 0.0);
+    const bool s_pair = (i_l == 0 && j_l == 0);
+
     double g[GSIZE_INT3C_1E];
 
     for (int ij = prim_ij; ij < prim_ij+nprim_ij; ++ij) {
+        if (do_screen) {
+            const double aij = a12[ij];
+            const double eij = e12[ij];
+            const double PCx = x12[ij] - Cx;
+            const double PCy = y12[ij] - Cy;
+            const double PCz = z12[ij] - Cz;
+            double a0 = aij;
+            const double q_over_p_plus_q = charge_exponent > 0.0 ? charge_exponent / (aij + charge_exponent) : 1.0;
+            const double sqrt_q_over_p_plus_q = charge_exponent > 0.0 ? sqrt(q_over_p_plus_q) : 1.0;
+            a0 *= q_over_p_plus_q;
+            const double theta = omega > 0.0 ? omega * omega / (omega * omega + a0) : 1.0;
+            const double sqrt_theta = omega > 0.0 ? sqrt(theta) : 1.0;
+            a0 *= theta;
+            // |prefactor| is an upper bound on the primitive's s-part magnitude
+            // since the Boys function F0(x) <= 1 for all x.
+            double bound = fabs(2.0 * M_PI / aij * eij * sqrt_theta * sqrt_q_over_p_plus_q);
+            const double boys_input = a0 * (PCx * PCx + PCy * PCy + PCz * PCz);
+            // For s-shells the exact factor is F0(boys_input) <= SQRTPIE4/sqrt(boys_input);
+            // apply this tighter grid-distance decay only for l=0 (no PA/PB polynomial).
+            if (s_pair && boys_input > 1e-14) {
+                bound *= SQRTPIE4 / sqrt(boys_input);
+            }
+            if (bound < screen_tol) {
+                continue;
+            }
+        }
         GINT_g1e<NROOTS>(g, grid_point, ish, jsh, ij, i_l, j_l, charge_exponent, omega);
         GINTcontract_gv_int3c1e<NROOTS>(g, gv_cart, fg_cart, ish, jsh, task_grid, i_l, j_l, ngrids);
     }
@@ -350,7 +388,7 @@ static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_
 static int GINTsgx_fused_k_gv_tasks(double* gv_cart, const double* fg_cart, const BasisProdOffsets offsets,
                                     const int i_l, const int j_l, const int nprim_ij, const int ngrids,
                                     const double omega, const double* grid_points,
-                                    const double* charge_exponents, const cudaStream_t stream)
+                                    const double* charge_exponents, const double screen_tol, const cudaStream_t stream)
 {
     const int nrys_roots = (i_l + j_l) / 2 + 1;
     const int ntasks_ij = offsets.ntasks_ij;
@@ -358,11 +396,11 @@ static int GINTsgx_fused_k_gv_tasks(double* gv_cart, const double* fg_cart, cons
     const dim3 threads(THREADSX, THREADSY);
     const dim3 blocks((ntasks_ij+THREADSX-1)/THREADSX, (ngrids+THREADSY-1)/THREADSY);
     switch (nrys_roots) {
-    case 1: GINTsgx_fused_k_gv_kernel_general<1, GSIZE1_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
-    case 2: GINTsgx_fused_k_gv_kernel_general<2, GSIZE2_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
-    case 3: GINTsgx_fused_k_gv_kernel_general<3, GSIZE3_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
-    case 4: GINTsgx_fused_k_gv_kernel_general<4, GSIZE4_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
-    case 5: GINTsgx_fused_k_gv_kernel_general<5, GSIZE5_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents); break;
+    case 1: GINTsgx_fused_k_gv_kernel_general<1, GSIZE1_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents, screen_tol); break;
+    case 2: GINTsgx_fused_k_gv_kernel_general<2, GSIZE2_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents, screen_tol); break;
+    case 3: GINTsgx_fused_k_gv_kernel_general<3, GSIZE3_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents, screen_tol); break;
+    case 4: GINTsgx_fused_k_gv_kernel_general<4, GSIZE4_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents, screen_tol); break;
+    case 5: GINTsgx_fused_k_gv_kernel_general<5, GSIZE5_INT3C_1E> <<<blocks, threads, 0, stream>>>(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids, omega, grid_points, charge_exponents, screen_tol); break;
     default:
         fprintf(stderr, "GINTsgx_fused_k_gv: rys roots %d out of range\n", nrys_roots);
         return 1;
@@ -404,7 +442,7 @@ int GINTsgx_fused_k_gv(const cudaStream_t stream, const BasisProdCache* bpcache,
                        const double* grid_points, const double* charge_exponents, const int ngrids,
                        double* gv_cart, const double* fg_cart,
                        const int* bins_locs_ij, int nbins,
-                       const int cp_ij_id, const double omega)
+                       const int cp_ij_id, const double omega, const double screen_tol)
 {
     const ContractionProdType *cp_ij = bpcache->cptype + cp_ij_id;
     const int i_l = cp_ij->l_bra;
@@ -438,7 +476,7 @@ int GINTsgx_fused_k_gv(const cudaStream_t stream, const BasisProdCache* bpcache,
         offsets.primitive_kl = -1;
 
         const int err = GINTsgx_fused_k_gv_tasks(gv_cart, fg_cart, offsets, i_l, j_l, nprim_ij, ngrids,
-                                                 omega, grid_points, charge_exponents, stream);
+                                                 omega, grid_points, charge_exponents, screen_tol, stream);
         if (err != 0) {
             return err;
         }

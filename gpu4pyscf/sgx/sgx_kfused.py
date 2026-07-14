@@ -317,7 +317,7 @@ def get_k_fused_general(mol, dm, grids, tol=1e-8, ovlp_fit=True,
 
 
 def get_k_fused_direct(mol, dm, grids, tol=1e-8, ovlp_fit=True,
-                       blksize=None, return_stats=False):
+                       blksize=None, screen_tol=0.0, return_stats=False):
     """TRUE tensor-free fused COSX exchange K for ALL angular momenta.
 
     A CUDA kernel computes each shell-pair's Cartesian integral via GINT_g1e and
@@ -415,7 +415,8 @@ def get_k_fused_direct(mol, dm, grids, tol=1e-8, ovlp_fit=True,
                 bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_int(nbins),
                 ctypes.c_int(cp_ij_id),
-                ctypes.c_double(omega))
+                ctypes.c_double(omega),
+                ctypes.c_double(screen_tol))
             if err != 0:
                 raise RuntimeError(f"GINTsgx_fused_k_gv failed with code {err}")
 
