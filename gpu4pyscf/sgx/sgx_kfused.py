@@ -317,7 +317,7 @@ def get_k_fused_general(mol, dm, grids, tol=1e-8, ovlp_fit=True,
 
 
 def get_k_fused_direct(mol, dm, grids, tol=1e-8, ovlp_fit=True,
-                       return_stats=False):
+                       blksize=None, return_stats=False):
     """TRUE tensor-free fused COSX exchange K for ALL angular momenta.
 
     A CUDA kernel computes each shell-pair's Cartesian integral via GINT_g1e and
@@ -340,9 +340,6 @@ def get_k_fused_direct(mol, dm, grids, tol=1e-8, ovlp_fit=True,
     ngrids = coords.shape[0]
 
     ni = gnumint.NumInt()
-    ao = cp.asarray(ni.eval_ao(mol, coords, deriv=0), dtype=cp.float64)  # (ng, nao) sph mol
-    wao = ao * weights[:, None]
-    sn = ao.T @ wao
 
     intopt = VHFOpt(mol)
     intopt.build(1e-13, aosym=True)
@@ -351,13 +348,7 @@ def get_k_fused_direct(mol, dm, grids, tol=1e-8, ovlp_fit=True,
     C = intopt.cart2sph                    # (nao_cart, nao_sph) sorted
     nao_cart = C.shape[0]
 
-    # fg (sph mol) -> sph sorted -> cart sorted, contiguous (nao_cart, ng).
-    fg_sph_mol = cp.einsum("tj,gj->tg", dm, wao)              # (nao, ng)
-    fg_sph_sorted = intopt.sort_orbitals(fg_sph_mol, axis=[0])  # (nao_sph, ng)
-    fg_cart = cp.ascontiguousarray(C @ fg_sph_sorted)          # (nao_cart, ng)
-
-    gv_cart = cp.zeros((nao_cart, ngrids), dtype=cp.float64)   # <- the only big intermediate
-
+    # Density-based shell-pair-type block screening (grid-independent).
     dm_np = cp.asnumpy(dm)
     n_blocks = len(intopt.log_qs)
     keep_block = [True] * n_blocks
@@ -381,33 +372,58 @@ def get_k_fused_direct(mol, dm, grids, tol=1e-8, ovlp_fit=True,
                  if len(intopt.log_qs[c]) > 0 and keep_block[c])
     frac_skipped = 1.0 - (n_kept / n_nonempty) if n_nonempty else 0.0
 
+    # Grid blocking: keep the tensor-free intermediate (nao_cart, blk) bounded.
+    # Peak per chunk ~ nao_cart * blk (NOT nao_cart * ngrids, NOT nao*nao*ngrids).
+    if blksize is None:
+        # cap gv_cart+fg_cart per chunk near ~256 MB total.
+        blksize = max(256, int(128e6 / 8 / max(nao_cart, 1)))
+
+    sn = cp.zeros((nao, nao))
+    vk = cp.zeros((nao, nao))
     stream = cp.cuda.get_current_stream()
-    for cp_ij_id in range(n_blocks):
-        log_q_ij = intopt.log_qs[cp_ij_id]
-        if len(log_q_ij) == 0 or not keep_block[cp_ij_id]:
-            continue
-        nbins = 1
-        bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
-        err = libgint.GINTsgx_fused_k_gv(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
-            intopt.bpcache,
-            ctypes.cast(coords.data.ptr, ctypes.c_void_p),
-            ctypes.cast(0, ctypes.c_void_p),          # charge_exponents = NULL
-            ctypes.c_int(ngrids),
-            ctypes.cast(gv_cart.data.ptr, ctypes.c_void_p),
-            ctypes.cast(fg_cart.data.ptr, ctypes.c_void_p),
-            bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nbins),
-            ctypes.c_int(cp_ij_id),
-            ctypes.c_double(omega))
-        if err != 0:
-            raise RuntimeError(f"GINTsgx_fused_k_gv failed with code {err}")
 
-    # gv_cart (nao_cart, ng) -> sph sorted -> sph mol.
-    gv_sph_sorted = C.T @ gv_cart                            # (nao_sph, ng)
-    gv = intopt.unsort_orbitals(gv_sph_sorted, axis=[0])     # (nao, ng)
+    for p0 in range(0, ngrids, blksize):
+        p1 = min(p0 + blksize, ngrids)
+        blk = p1 - p0
+        coords_blk = cp.ascontiguousarray(coords[p0:p1])
+        w_blk = weights[p0:p1]
+        ao_blk = cp.asarray(ni.eval_ao(mol, coords_blk, deriv=0), dtype=cp.float64)  # (blk, nao)
+        wao = ao_blk * w_blk[:, None]
+        sn += ao_blk.T @ wao
 
-    vk = cp.einsum("gu,vg->uv", ao, gv)                      # (nao, nao)
+        # fg (sph mol) -> sph sorted -> cart sorted, (nao_cart, blk).
+        fg_sph_mol = cp.einsum("tj,gj->tg", dm, wao)             # (nao, blk)
+        fg_sph_sorted = intopt.sort_orbitals(fg_sph_mol, axis=[0])
+        fg_cart = cp.ascontiguousarray(C @ fg_sph_sorted)         # (nao_cart, blk)
+
+        gv_cart = cp.zeros((nao_cart, blk), dtype=cp.float64)     # the only big intermediate
+
+        for cp_ij_id in range(n_blocks):
+            log_q_ij = intopt.log_qs[cp_ij_id]
+            if len(log_q_ij) == 0 or not keep_block[cp_ij_id]:
+                continue
+            nbins = 1
+            bins_locs_ij = np.array([0, len(log_q_ij)], dtype=np.int32)
+            err = libgint.GINTsgx_fused_k_gv(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                intopt.bpcache,
+                ctypes.cast(coords_blk.data.ptr, ctypes.c_void_p),
+                ctypes.cast(0, ctypes.c_void_p),          # charge_exponents = NULL
+                ctypes.c_int(blk),
+                ctypes.cast(gv_cart.data.ptr, ctypes.c_void_p),
+                ctypes.cast(fg_cart.data.ptr, ctypes.c_void_p),
+                bins_locs_ij.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(nbins),
+                ctypes.c_int(cp_ij_id),
+                ctypes.c_double(omega))
+            if err != 0:
+                raise RuntimeError(f"GINTsgx_fused_k_gv failed with code {err}")
+
+        gv_sph_sorted = C.T @ gv_cart                            # (nao_sph, blk)
+        gv = intopt.unsort_orbitals(gv_sph_sorted, axis=[0])     # (nao, blk)
+        vk += cp.einsum("gu,vg->uv", ao_blk, gv)                 # (nao, nao)
+
+    peak_bytes = int(nao_cart * min(blksize, ngrids) * 8)
 
     if ovlp_fit:
         ovlp = cp.asarray(mol.intor_symmetric("int1e_ovlp"))
@@ -419,7 +435,7 @@ def get_k_fused_direct(mol, dm, grids, tol=1e-8, ovlp_fit=True,
     if return_stats:
         stats = {
             "tensor_free": True,
-            "peak_intermediate_bytes": int(nao_cart * ngrids * 8),
+            "peak_intermediate_bytes": int(peak_bytes),
             "frac_blocks_skipped": float(frac_skipped),
         }
         return vk, stats
