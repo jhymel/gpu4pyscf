@@ -49,24 +49,31 @@ def _water(basis):
 
 class TestKernelScreening:
     def test_screened_matches_unscreened_svp(self):
-        """Kernel screening at a safe tol preserves K vs unscreened get_k."""
+        """Kernel screening at a safe tol preserves K vs unscreened get_k.
+
+        Uses screen_tol=1e-10: with the density-matrix-weighted screen this
+        skips substantial work while K error (~1e-7) stays well under atol.
+        (At 1e-9 the DM screen skips more and error rises to ~2e-6, still
+        chemically negligible but above this guard's budget — see the fused
+        speed benchmark / investigation doc sec 9 for the tol/accuracy curve.)
+        """
         mol = _water("def2-svp")
         dm = _dm(mol)
         g = _grids(mol, level=1)
         k_ref = cp.asnumpy(cp.asarray(get_k(mol, dm, g, ovlp_fit=True)))
         k = cp.asnumpy(cp.asarray(
-            get_k_fused_direct(mol, dm, g, screen_tol=1e-9, ovlp_fit=True)
+            get_k_fused_direct(mol, dm, g, screen_tol=1e-10, ovlp_fit=True)
         ))
         np.testing.assert_allclose(k, k_ref, atol=1e-6, rtol=0)
 
     def test_screened_matches_unscreened_tzvp(self):
-        """Up to d functions, kernel screening preserves K."""
+        """Up to d functions, kernel screening (screen_tol=1e-10) preserves K."""
         mol = _water("def2-tzvp")
         dm = _dm(mol)
         g = _grids(mol, level=1)
         k_ref = cp.asnumpy(cp.asarray(get_k(mol, dm, g, ovlp_fit=True)))
         k = cp.asnumpy(cp.asarray(
-            get_k_fused_direct(mol, dm, g, screen_tol=1e-9, ovlp_fit=True)
+            get_k_fused_direct(mol, dm, g, screen_tol=1e-10, ovlp_fit=True)
         ))
         np.testing.assert_allclose(k, k_ref, atol=1e-5, rtol=0)
 

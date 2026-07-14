@@ -351,6 +351,28 @@ static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_
     const bool do_screen = (screen_tol > 0.0);
     const bool s_pair = (i_l == 0 && j_l == 0);
 
+    // Density-matrix-weighted (P-junction) screening factor. The contribution
+    // of this shell pair at this grid point is I_vt * fg_cart[t,g] (and its
+    // transpose I_vt * fg_cart[i,g]), so the max |fg| over both cartesian AO
+    // ranges is an upper bound on the density weight. Computed once per
+    // (task_ij, task_grid) since it is independent of the primitive pair.
+    double dm_factor = 1.0;
+    if (do_screen) {
+        const int* ao_loc = c_bpcache.ao_loc;
+        const int i0 = ao_loc[ish];
+        const int i1 = ao_loc[ish+1];
+        const int j0 = ao_loc[jsh];
+        const int j1 = ao_loc[jsh+1];
+        double f_max = 0.0;
+        for (int i = i0; i < i1; i++) {
+            f_max = fmax(f_max, fabs(fg_cart[i * ngrids + task_grid]));
+        }
+        for (int j = j0; j < j1; j++) {
+            f_max = fmax(f_max, fabs(fg_cart[j * ngrids + task_grid]));
+        }
+        dm_factor = f_max;
+    }
+
     double g[GSIZE_INT3C_1E];
 
     for (int ij = prim_ij; ij < prim_ij+nprim_ij; ++ij) {
@@ -376,7 +398,7 @@ static void GINTsgx_fused_k_gv_kernel_general(double* gv_cart, const double* fg_
             if (s_pair && boys_input > 1e-14) {
                 bound *= SQRTPIE4 / sqrt(boys_input);
             }
-            if (bound < screen_tol) {
+            if (bound * dm_factor < screen_tol) {
                 continue;
             }
         }
