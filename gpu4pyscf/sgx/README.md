@@ -26,22 +26,38 @@ OOM RI-JK) but **slower** than RI-JK. Screening is the next major piece.
 - RIJCOSX SCF energy vs CPU SGX SCF: ~1e-6 Eh.
 - Analytic gradient vs finite difference: ~1e-6 (error -> 0 as grid refines).
 
-## Testing during development (wheel-based env)
+## Building from source (required for B2 kernel work)
 
-The compiled primitives (`int1e_grids`, etc.) ship in the installed
-`gpu4pyscf-cuda12x` wheel, while this source tree is checked out at the matching
-tag (v1.7.1). To test the pure-Python `sgx` package against the installed
-compiled libs, copy `gpu4pyscf/sgx/` into the installed package and run pytest
-with an external rootdir (avoids the source-tree lib loader):
+B1 showed pure-Python screening cannot avoid building the dense
+`(ngrids, nao, nao)` integral. Kernel-level screening (B2) requires a source
+build with CUDA. Toolchain (conda-forge / pixi, CUDA 12.x):
 
 ```bash
-SP=$(python -c "import gpu4pyscf, os; print(os.path.dirname(gpu4pyscf.__file__))")
-cp -r gpu4pyscf/sgx "$SP"/
-pytest --rootdir=/tmp "$SP"/sgx/tests/ -v
+pixi add cmake ninja "cuda-nvcc=12.*" gfortran \
+         "cuda-cudart-dev=12.*" "cuda-nvrtc-dev=12.*" "cuda-cccl=12.*" libcublas-dev
 ```
 
-Once building GPU4PySCF from source (with compiled extensions), the tests run
-in-tree normally: `pytest gpu4pyscf/sgx/tests/ -v`.
+Build `gpu4pyscf/lib` (add your GPU's arch; A10G = sm_86):
+
+```bash
+ENV=$(python -c "import sys,os;print(os.path.dirname(os.path.dirname(sys.executable)))")
+export CUDA_HOME=$ENV PATH=$ENV/bin:$PATH
+cmake -B /tmp/g4build -S gpu4pyscf/lib -GNinja \
+  -DCUDA_ARCHITECTURES='80-real;86-real' -DBUILD_LIBXC=OFF \
+  -DCMAKE_CUDA_COMPILER=$ENV/bin/nvcc
+cmake --build /tmp/g4build -j 8    # ~15-20 min, 138 targets; writes gpu4pyscf/lib/*.so
+```
+
+Then import the source tree (not the wheel) and test in-tree:
+
+```bash
+PYTHONPATH=$(pwd) python -m pytest gpu4pyscf/sgx/tests/ -q   # 24 passed
+```
+
+Verified: full build green on sm_86 (nvcc 12.9), all 24 sgx tests pass against
+the from-source libraries.
+
+## Testing during development (wheel-based env)
 
 ## Benchmarks
 
